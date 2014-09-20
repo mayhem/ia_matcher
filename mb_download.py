@@ -10,12 +10,20 @@ import Levenshtein
 import re
 import psycopg2
 import config
+import musicbrainzngs
 
-MUSICBRAINZ_HOST = "asterix.mb"
-MUSICBRAINZ_PORT = 80
+MATCH_THRESHOLD = .4
+MIN_NUM_TRACKS = 3
+
+# Found track naming schemes
+# Various Artists - Casa De Mi Padre (Original Motion Picture Soundtrack) (2012) [FLAC]/01 - Christina Aguilera - Casa De Mi Padre.flac
+# Wild's Reprisal - Cascadia Rising (2012) [FLAC]/Wild's Reprisal - Cascadia Rising - 01 A fierce green fire dying in her eyes.flac
+# The Deadly Gentlemen - Carry Me To Home [FLAC]/The Deadly Gentlemen - Carry Me To Home - 01 Sober Cure.flac
+# The New York Lounge Society - Christmas Chill (2010) [FLAC]/01 - Joy to the World.flac
+# Twista-Category_F5-2009-H3X/06-twista-walking_on_ice_ft._gucci_mane_and_oj_da_juiceman.mp3
 
 def clean_string(s):
-    return re.sub('[-\W_]', '', s).lower()
+    return unicode(re.sub('[-\W_]', '', s).lower())
 
 def pick_duration(tracks):
     '''Pick the most plausible duration. Fun guessing for all!'''
@@ -39,8 +47,40 @@ def set_error(conn, iaid, err):
 
 def update_timestamp(conn, iaid):
     cur = conn.cursor()
-    cur.execute('UPDATE match SET ts = now() where iaid = %s', (iaid))
+    cur.execute('UPDATE match SET ts = now() where iaid = %s', (iaid,))
     conn.commit()
+
+def set_mbid(conn, iaid, mbid):
+    cur = conn.cursor()
+    cur.execute('UPDATE match SET ts = now(), mbid = %s where iaid = %s', (mbid, iaid))
+    conn.commit()
+
+def match_tracks_to_release(title, tracks, mbid, name):
+    '''
+       Given a list of tracks, a candidate release mbid and name this function should return
+       a score (0.0-1.0) of how well this list of tracks compares to the MB release.
+    '''
+
+    try:
+        musicbrainzngs.set_useragent("ruaok's IA matcher", "0.1", "rob@")
+        rel = musicbrainzngs.get_release_by_id(mbid, includes=['recordings'])
+    except musicbrainzngs.WebServiceError as exc:
+        print "Something went wrong with the request: %s" % exc 
+        return -1
+
+#    print "--- %-40s %s" % (title.encode('utf-8'), name.encode('utf-8'))
+    matches = []
+    total = 0.0
+    print 
+    for i, t in enumerate(rel["release"]["medium-list"][0]["track-list"]):
+        try:
+            d = Levenshtein.ratio(clean_string(t['recording']['title']), tracks[i]['clean'])
+            print "%.3f %2d %-40s | %s" % (d, i+1, clean_string(t['recording']['title']), tracks[i]['clean'])
+            total += d
+        except IndexError:
+            return -1
+
+    return total / len(tracks)
 
 next_delay = 0.0
 def mb_download(conn, iaid, data):
@@ -49,9 +89,13 @@ def mb_download(conn, iaid, data):
     release = { 'durations' : [], 'tracks' : [] }
     num_tracks = 0
 
-    js = json.loads(data)
+    try:
+        js = json.loads(data)
+    except ValueError:
+        return set_error(conn, iaid, "cannot parse ia json")
 
     tracks = {}
+    release_name = ""
     try:    
         for f in js['files']:
             try:
@@ -88,10 +132,37 @@ def mb_download(conn, iaid, data):
             except IndexError:
                 name = f['name']
 
-            try:
-                name = name.split(".")[0]
-            except:
-                pass
+            if not release_name:
+                try:
+                    release_name = f['name'].split('/')[0]
+                    release_name = release_name.split('-')[1].strip()
+                except IndexError:
+                    pass
+
+#            print "1", name
+
+            # remove the file extension
+            ri = name.rfind(".")
+            if ri != -1:
+                name = name[:ri]
+
+#            print "2", name
+
+            # remove everything before the last '-'
+            ri = name.rfind("-")
+            if ri != -1:
+                name = name[(ri+1):]
+
+#            print "3", name
+
+
+            # if the track number is at the beginning of the track text, nuke it.
+            name = name.strip()
+            if name.startswith("%02d" % (int(track) + 1)):
+                name = name[2:].strip()
+
+#            print "4", name
+#            print 
 
             clean = clean_string(name)
             if not tracks.has_key(track):
@@ -129,63 +200,43 @@ def mb_download(conn, iaid, data):
 #    for t in tracks:
 #        print "%d. %s - %.3f" % (t['num'], t['name'], t['duration'])
 
-    if len(tracks) < 5:
-        if len(tracks) < 1:
-            return set_error(conn, iaid, "0 tracks found in json")
-        else:
+    if len(tracks) < 1:
+        return set_error(conn, iaid, "0 tracks found in json")
+    if len(tracks)  < MIN_NUM_TRACKS:
             return set_error(conn, iaid, "too few tracks on this release")
 
-    total_sectors = 150
-    for t in tracks:
-        total_sectors += int(t['duration'] * 75)
+    ms_durations = [ "%d" % int(t['duration'] * 1000) for t in tracks]
+    dur_str = ",".join(ms_durations)
+    dur_str = "'{" + dur_str + "}'"
 
-    toc = "1+%d+%d+150" % (len(tracks), total_sectors)
-    offset = 150
-    for t in tracks[:-1]:
-        toc += "+%d" % (offset + int(t['duration'] * 75))
-        offset += int(t['duration'] * 75)
-
-    url = 'http://musicbrainz.org/ws/2/discid/-?toc=%s&media-format=all&fmt=json&inc=recordings' % toc
-
-    sleep(next_delay)
-
-    timeout_delay = 5
-    while True:
-        try:    
-            t0 = time()
-            opener = urllib2.build_opener()
-            opener.addheaders = [('User-agent', "ruaoks IA matcher (1.00)")]
-            response = opener.open(url, timeout = 15)
-            break
-        except urllib2.HTTPError, e:
-            if e.code == 503:
-                print "Got 503. Sleeping %s seconds" % timeout_delay
-                sleep(timeout_delay)
-                timeout_delay *= 2
-                continue
-            if e.code == 400:
-                set_error(conn, iaid, "400 on fetch from mb")
-                continue
-
-            print "HTTP error: " , e
-            return False
-        except urllib2.URLError, e:
-            print "URL error: " , e
-            return False
-
-    data = response.read()
-    t1 = time()
-    next_delay = max(0, 1.0 - (t1 - t0))
-
+    query = """SELECT gid, name, cube_distance(toc, create_cube_from_durations(%s)) AS distance
+                 FROM release_toc 
+                WHERE toc <@ create_bounding_cube(%s, %d)
+             ORDER BY distance""" % (dur_str, dur_str, 3000)
     cur = conn.cursor()
-    cur.execute("UPDATE match SET mb_data = %s, ts = now() WHERE iaid = %s", (data, iaid))
-    conn.commit()
+    cur.execute(query)
+    rows = cur.fetchall()
+    cur.close()
 
-    js = json.loads(data)
-    if len(js['releases']) == 0:
-        return "zero mb hits"
+    if rows:
+        hi = -1
+        hi_index = -1
+        for i, row in enumerate(rows):
+            score = match_tracks_to_release(release_name, tracks, row[0], row[1])
+            if score > hi:
+                hi = score
+                hi_index = i
 
-    return "ok"
+        if hi_index >= 0:
+            if hi > MATCH_THRESHOLD:
+                mbid = rows[hi_index][0]
+                print "picking %s - %.3f" % (mbid, hi)
+                set_mbid(conn, iaid, mbid)
+                return mbid
+            else:
+                return set_error(conn, iaid, "match below threshold")
+
+    return set_error(conn, iaid, "no toc match")
 
 try:
     conn = psycopg2.connect(config.PG_CONNECT)
@@ -206,9 +257,11 @@ while True:
     rows = cur.fetchall()
     cur.close()
 
+    if len(rows) == 0:
+        break
+
     for row in rows:
         ret = mb_download(conn, row[0], row[1])
-        print "%-30s %s" % (ret, row[0])
-        sleep(.75)
+        print "%-37s %s" % (ret, row[0])
 
 print "done"
