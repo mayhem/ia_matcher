@@ -98,10 +98,7 @@ def mb_download(conn, iaid, data):
     release_name = ""
     try:    
         for f in js['files']:
-            try:
-                if f['length'] == '00:30':
-                    continue
-            except KeyError:
+            if f.get('source', 'derivative') == 'derivative':
                 continue
 
             try:
