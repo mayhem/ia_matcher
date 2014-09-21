@@ -11,9 +11,12 @@ import re
 import psycopg2
 import config
 import musicbrainzngs
+from ia_parse import ParseArchiveData, clean_string
 
+MAX_TOC_MATCHES = 10
 MATCH_THRESHOLD = .4
-MIN_NUM_TRACKS = 3
+MIN_NUM_TRACKS = 4
+DRY_RUN = 0
 
 # Found track naming schemes
 # Various Artists - Casa De Mi Padre (Original Motion Picture Soundtrack) (2012) [FLAC]/01 - Christina Aguilera - Casa De Mi Padre.flac
@@ -22,38 +25,40 @@ MIN_NUM_TRACKS = 3
 # The New York Lounge Society - Christmas Chill (2010) [FLAC]/01 - Joy to the World.flac
 # Twista-Category_F5-2009-H3X/06-twista-walking_on_ice_ft._gucci_mane_and_oj_da_juiceman.mp3
 
-def clean_string(s):
-    return unicode(re.sub('[-\W_]', '', s).lower())
+query_find_unprocessed = """SELECT iaid, ia_data 
+                              FROM match 
+                             WHERE mb_data IS NULL 
+                               AND mbid IS NULL 
+                               AND err IS NULL 
+                          ORDER BY ts ASC 
+                             LIMIT 100"""
 
-def pick_duration(tracks):
-    '''Pick the most plausible duration. Fun guessing for all!'''
-
-    hi = 0.0
-    for t in tracks:
-        d = t['duration']
-        if hi > d:
-            hi = d
-        if d == 0.0 or d == 30.0 or d == 60.0:
-            continue
-        return d
-
-    return hi
+query_rerun_low_matches= """SELECT iaid, ia_data 
+                              FROM match 
+                             WHERE mb_data IS NULL 
+                               AND mbid IS NULL 
+                               AND err = 'match below threshold'
+                          ORDER BY ts ASC 
+                             LIMIT 100"""
 
 def set_error(conn, iaid, err):
-    cur = conn.cursor()
-    cur.execute('UPDATE match SET ts = now(), err = %s where iaid = %s', (err, iaid))
-    conn.commit()
+    if not DRY_RUN:
+        cur = conn.cursor()
+        cur.execute('UPDATE match SET ts = now(), err = %s where iaid = %s', (err, iaid))
+        conn.commit()
     return err
 
 def update_timestamp(conn, iaid):
-    cur = conn.cursor()
-    cur.execute('UPDATE match SET ts = now() where iaid = %s', (iaid,))
-    conn.commit()
+    if not DRY_RUN:
+        cur = conn.cursor()
+        cur.execute('UPDATE match SET ts = now() where iaid = %s', (iaid,))
+        conn.commit()
 
 def set_mbid(conn, iaid, mbid):
-    cur = conn.cursor()
-    cur.execute('UPDATE match SET ts = now(), mbid = %s where iaid = %s', (mbid, iaid))
-    conn.commit()
+    if not DRY_RUN:
+        cur = conn.cursor()
+        cur.execute("UPDATE match SET ts = now(), mbid = %s, err = '' where iaid = %s", (mbid, iaid))
+        conn.commit()
 
 def match_tracks_to_release(title, tracks, mbid, name):
     '''
@@ -82,116 +87,13 @@ def match_tracks_to_release(title, tracks, mbid, name):
 
     return total / len(tracks)
 
-next_delay = 0.0
-def mb_download(conn, iaid, data):
-    global next_delay
+def mb_match(conn, iaid, data):
 
-    release = { 'durations' : [], 'tracks' : [] }
-    num_tracks = 0
+    release, err = ParseArchiveData().parse(iaid, data) 
+    if err:
+        return set_error(conn, iaid, err)
 
-    try:
-        js = json.loads(data)
-    except ValueError:
-        return set_error(conn, iaid, "cannot parse ia json")
-
-    tracks = {}
-    release_name = ""
-    try:    
-        for f in js['files']:
-            if f.get('source', 'derivative') == 'derivative':
-                continue
-
-            try:
-                raw_track_text = f['track']
-            except KeyError:
-                continue
-
-            try:
-                track, num_tracks = raw_track_text.split("/")
-            except ValueError:
-                track = raw_track_text
-
-            try:
-                track = int(track) - 1
-            except ValueError:
-                continue
-            try:
-                duration = float(f['length'])
-            except:
-                if f['length'].find(':') >= 0:
-                    m, s = f['length'].split(':')
-                    duration = float(m) * 60.0 + float(s)
-                else:
-                    set_error(conn, iaid, "Uknown length format: '%s'" % f['length'])
-
-            try:
-                name = f['name'].split('/')[1]
-            except IndexError:
-                name = f['name']
-
-            if not release_name:
-                try:
-                    release_name = f['name'].split('/')[0]
-                    release_name = release_name.split('-')[1].strip()
-                except IndexError:
-                    pass
-
-#            print "1", name
-
-            # remove the file extension
-            ri = name.rfind(".")
-            if ri != -1:
-                name = name[:ri]
-
-#            print "2", name
-
-            # remove everything before the last '-'
-            ri = name.rfind("-")
-            if ri != -1:
-                name = name[(ri+1):]
-
-#            print "3", name
-
-
-            # if the track number is at the beginning of the track text, nuke it.
-            name = name.strip()
-            if name.startswith("%02d" % (int(track) + 1)):
-                name = name[2:].strip()
-
-#            print "4", name
-#            print 
-
-            clean = clean_string(name)
-            if not tracks.has_key(track):
-                tracks[track] = []
-            tracks[track].append(dict(num=track, duration=duration, name=name, clean=clean, source=f['source']))
-
-    except KeyError:
-        return set_error(conn, iaid, "key error in ia json")
-
-#    for k in sorted(tracks.keys()):
-#        for t in tracks[k]:
-#            print t
-#        print
-
-    if len(tracks) > 0:
-        new_list = [ ]
-        for i in xrange(len(tracks)):
-            try:
-                dummy = tracks[i]
-            except KeyError:
-                return set_error(conn, iaid, "incomplete tracklist");
-
-            for t in tracks[i]:
-                if t['source'] == 'original':
-                    if t['duration'] == 0.0:
-                        t['duration'] = pick_duration(tracks[i])
-                        if t['duration'] == 0.0:
-                            return set_error(conn, iaid, "release with missing track duration")
-
-                    new_list.append(t)
-
-        tracks = new_list
+    tracks = release['tracks']
 
 #    print iaid
 #    for t in tracks:
@@ -209,7 +111,8 @@ def mb_download(conn, iaid, data):
     query = """SELECT gid, name, cube_distance(toc, create_cube_from_durations(%s)) AS distance
                  FROM release_toc 
                 WHERE toc <@ create_bounding_cube(%s, %d)
-             ORDER BY distance""" % (dur_str, dur_str, 3000)
+             ORDER BY distance
+                LIMIT %s""" % (dur_str, dur_str, 3000, MAX_TOC_MATCHES)
     cur = conn.cursor()
     cur.execute(query)
     rows = cur.fetchall()
@@ -219,7 +122,7 @@ def mb_download(conn, iaid, data):
         hi = -1
         hi_index = -1
         for i, row in enumerate(rows):
-            score = match_tracks_to_release(release_name, tracks, row[0], row[1])
+            score = match_tracks_to_release(release['name'], tracks, row[0], row[1])
             if score > hi:
                 hi = score
                 hi_index = i
@@ -244,13 +147,7 @@ except psycopg2.OperationalError as err:
 
 while True:
     cur = conn.cursor()
-    cur.execute("""SELECT iaid, ia_data 
-                     FROM match 
-                    WHERE mb_data IS NULL 
-                      AND mbid IS NULL 
-                      AND err IS NULL 
-                 ORDER BY ts ASC 
-                    LIMIT 100""")
+    cur.execute(query_rerun_low_matches)
     rows = cur.fetchall()
     cur.close()
 
@@ -258,7 +155,7 @@ while True:
         break
 
     for row in rows:
-        ret = mb_download(conn, row[0], row[1])
+        ret = mb_match(conn, row[0], row[1])
         print "%-37s %s" % (ret, row[0])
 
 print "done"
