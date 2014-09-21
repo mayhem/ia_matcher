@@ -114,7 +114,7 @@ class ParseArchiveData(object):
             for t in tracks[i]:
                 if t['source'] == 'original':
                     if t['duration'] == 0.0:
-                        t['duration'] = self.pick_duration(tracks[i])
+                        t['duration'] = self._pick_duration(tracks[i])
                         if t['duration'] == 0.0:
                             return ({}, "release with missing track duration")
 

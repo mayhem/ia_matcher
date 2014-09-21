@@ -12,11 +12,11 @@ import psycopg2
 import config
 import musicbrainzngs
 from ia_parse import ParseArchiveData, clean_string
+from match_utils import set_error, set_mbid, update_timestamp
 
 MAX_TOC_MATCHES = 10
 MATCH_THRESHOLD = .4
 MIN_NUM_TRACKS = 4
-DRY_RUN = 0
 
 # Found track naming schemes
 # Various Artists - Casa De Mi Padre (Original Motion Picture Soundtrack) (2012) [FLAC]/01 - Christina Aguilera - Casa De Mi Padre.flac
@@ -40,25 +40,6 @@ query_rerun_low_matches= """SELECT iaid, ia_data
                                AND err = 'match below threshold'
                           ORDER BY ts ASC 
                              LIMIT 100"""
-
-def set_error(conn, iaid, err):
-    if not DRY_RUN:
-        cur = conn.cursor()
-        cur.execute('UPDATE match SET ts = now(), err = %s where iaid = %s', (err, iaid))
-        conn.commit()
-    return err
-
-def update_timestamp(conn, iaid):
-    if not DRY_RUN:
-        cur = conn.cursor()
-        cur.execute('UPDATE match SET ts = now() where iaid = %s', (iaid,))
-        conn.commit()
-
-def set_mbid(conn, iaid, mbid):
-    if not DRY_RUN:
-        cur = conn.cursor()
-        cur.execute("UPDATE match SET ts = now(), mbid = %s, err = '' where iaid = %s", (mbid, iaid))
-        conn.commit()
 
 def match_tracks_to_release(title, tracks, mbid, name):
     '''
@@ -131,7 +112,7 @@ def mb_match(conn, iaid, data):
             if hi > MATCH_THRESHOLD:
                 mbid = rows[hi_index][0]
                 print "picking %s - %.3f" % (mbid, hi)
-                set_mbid(conn, iaid, mbid)
+                set_mbid(conn, iaid, mbid, len(tracks))
                 return mbid
             else:
                 return set_error(conn, iaid, "match below threshold")
