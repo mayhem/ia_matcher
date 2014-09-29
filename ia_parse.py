@@ -40,20 +40,39 @@ class ParseArchiveData(object):
                 if f.get('source', 'derivative') == 'derivative':
                     continue
 
-                try:
-                    raw_track_text = f['track']
-                except KeyError:
+                if not f['name'].endswith(".mp3") and not f['name'].endswith(".flac"):
                     continue
 
-                try:
-                    track, num_tracks = raw_track_text.split("/")
-                except ValueError:
-                    track = raw_track_text
+                track = ""
+                # If we have track field, parse it
+                if f.has_key('track'):
+                    try:
+                        raw_track_text = f['track']
+                    except KeyError:
+                        continue
 
-                try:
-                    track = int(track) - 1
-                except ValueError:
+                    try:
+                        track, num_tracks = raw_track_text.split("/")
+                    except ValueError:
+                        track = raw_track_text
+
+                    try:
+                        track = int(track) - 1
+                    except ValueError:
+                        continue
+
+                # see if the track starts with a number
+                if not track: 
+                    m = re.match('^[0-9]+', f['name'])
+                    if m:
+                        try:
+                            track = int(m.group(0))
+                        except ValueError:
+                            pass
+
+                if not track: 
                     continue
+
                 try:
                     duration = float(f['length'])
                 except:
@@ -119,5 +138,8 @@ class ParseArchiveData(object):
                             return ({}, "release with missing track duration")
 
                     track_list.append(t)
+
+        if len(track_list) == 0:
+            return ({}, "0 tracks found in json")
 
         return (dict(tracks=track_list, name=release_name), "")

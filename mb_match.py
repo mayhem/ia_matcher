@@ -48,7 +48,7 @@ def match_tracks_to_release(title, tracks, mbid, name):
     '''
 
     try:
-        musicbrainzngs.set_useragent("ruaok's IA matcher", "0.1", "rob@")
+        musicbrainzngs.set_useragent(config.USER_AGENT_STRING, config.USER_AGENT_VERSION, config.USER_AGENT_USER)
         rel = musicbrainzngs.get_release_by_id(mbid, includes=['recordings'])
     except musicbrainzngs.WebServiceError as exc:
         print "Something went wrong with the request: %s" % exc 
